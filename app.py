@@ -1,7 +1,3 @@
-
-
-
-
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 import os, json, re
@@ -17,6 +13,91 @@ except Exception:
     USE_QDRANT = False
     faiss = None
 
+from datetime import datetime
+import difflib
+
+YEAR_PATTERN = re.compile(r"\b(20\d{2})\b")
+
+DEFAULT_KEYWORDS = {
+    "select all",
+    "all",
+    "rural+urban",
+    "all ages",
+    "annual",
+    "annually"
+}
+
+
+def select_best_filter_option(
+    query,
+    filter_name,
+    options,
+    cross_encoder
+):
+    q_lower = query.lower()
+    fname_lower = filter_name.lower()
+    current_year = datetime.now().year
+
+    # ---------------- Year special handling ----------------
+    if fname_lower == "year":
+        query_has_year = bool(YEAR_PATTERN.search(q_lower))
+
+        def extract_year(opt):
+            text = str(opt.get("option", ""))
+            m = YEAR_PATTERN.search(text)
+            return int(m.group(1)) if m else None
+
+        # ✅ If user did NOT mention a year → latest valid year
+        if not query_has_year:
+            valid_years = []
+            for opt in options:
+                y = extract_year(opt)
+                if y is not None and y <= current_year:
+                    valid_years.append((y, opt))
+
+            if valid_years:
+                return max(valid_years, key=lambda t: t[0])[1]
+
+        # 🔁 Fallback to ML (same as your other file)
+        pairs = [(query, f"{filter_name} {o['option']}") for o in options]
+        scores = cross_encoder.predict(pairs)
+        return options[int(np.argmax(scores))]
+
+    # ---------------- All other filters ----------------
+    mentioned = []
+
+    for opt in options:
+        opt_text = str(opt.get("option", "")).strip()
+        if not opt_text:
+            continue
+
+        if opt_text.lower() in q_lower:
+            mentioned.append(opt)
+        else:
+            for word in q_lower.split():
+                if difflib.SequenceMatcher(
+                    None, opt_text.lower(), word
+                ).ratio() > 0.8:
+                    mentioned.append(opt)
+                    break
+
+    if mentioned:
+        pairs = [(query, f"{filter_name} {o['option']}") for o in mentioned]
+        scores = cross_encoder.predict(pairs)
+        return mentioned[int(np.argmax(scores))]
+
+    # 🔹 Default option fallback
+    def is_default(opt):
+        return str(opt.get("option", "")).strip().lower() in DEFAULT_KEYWORDS
+
+    defaults = [o for o in options if is_default(o)]
+    if defaults:
+        return defaults[0]
+
+    # 🔁 Final ML fallback
+    pairs = [(query, f"{filter_name} {o['option']}") for o in options]
+    scores = cross_encoder.predict(pairs)
+    return options[int(np.argmax(scores))]
 
 # =========================================================
 # HELPERS
@@ -290,12 +371,16 @@ def predict():
 
         best_filters = []
         for fname, opts in grouped.items():
-            pairs = [(q, f"{fname} {o['option']}") for o in opts]
-            scores = cross_encoder.predict(pairs)
+            best_opt = select_best_filter_option(
+                query=q,
+                filter_name=fname,
+                options=opts,
+                cross_encoder=cross_encoder
+            )
             best_filters.append({
-                "filter_name": fname,
-                "option": opts[int(np.argmax(scores))]["option"]
-            })
+              "filter_name": fname,
+              "option": best_opt["option"]
+        })
 
         results.append({
             "dataset": dataset["name"],
